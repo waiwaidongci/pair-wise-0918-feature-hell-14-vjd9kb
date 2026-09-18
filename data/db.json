@@ -26,11 +26,20 @@
       "id": "retest_demo",
       "clockId": "clock_demo",
       "adjustmentId": "adjustment_demo",
+      "testedBy": "周慎之",
       "testedAt": "2026-06-16T00:00:00.000Z",
+      "createdAt": "2026-06-16T00:00:00.000Z",
       "dailyRateSeconds": 31,
       "amplitude": 248,
       "qualified": false,
-      "note": "仍偏快，振幅尚可"
+      "note": "仍偏快，振幅尚可",
+      "signoffStatus": "approved",
+      "signoff": {
+        "conclusion": "approved",
+        "signature": "衡鉴工",
+        "signedAt": "2026-06-16T01:00:00.000Z",
+        "note": "确认首轮结论，继续调校"
+      }
     }
   ]
 }
