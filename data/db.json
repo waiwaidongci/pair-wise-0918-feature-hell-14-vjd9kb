@@ -30,6 +30,9 @@
       "dailyRateSeconds": 31,
       "amplitude": 248,
       "qualified": false,
+      "status": "approved",
+      "recordedBy": "tester_demo",
+      "signoff": null,
       "note": "仍偏快，振幅尚可"
     }
   ]

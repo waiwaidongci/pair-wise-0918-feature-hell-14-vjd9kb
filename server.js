@@ -37,6 +37,9 @@ const initialData = {
       dailyRateSeconds: 31,
       amplitude: 248,
       qualified: false,
+      status: "approved",
+      recordedBy: "tester_demo",
+      signoff: null,
       note: "仍偏快，振幅尚可"
     }
   ]
@@ -50,6 +53,7 @@ const routes = [
   "GET /clocks/:id/history",
   "POST /clocks/:id/adjustments",
   "POST /clocks/:id/retests",
+  "POST /retests/:id/signoff",
   "GET /clocks/:id/latest-retest",
   "GET /adjustments",
   "GET /retests"
@@ -66,7 +70,15 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 兼容旧数据：没有签核状态的历史复测视为已生效
+  db.retests = db.retests.map((item) => ({
+    signoff: null,
+    recordedBy: null,
+    ...item,
+    status: item.status || "approved"
+  }));
+  return db;
 }
 
 async function writeDb(data) {
@@ -126,14 +138,23 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
+function latestApprovedRetest(db, clockId) {
+  return db.retests
+    .filter((item) => item.clockId === clockId && item.status === "approved")
+    .sort((a, b) => new Date(b.testedAt) - new Date(a.testedAt))[0] || null;
+}
+
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
+  const approved = latestApprovedRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    latestApprovedRetest: approved,
+    // 合格状态只由已签核通过的复测决定，待签核/驳回/失效记录不影响
+    qualified: approved ? approved.qualified : false
   };
 }
 
@@ -183,7 +204,15 @@ async function handle(req, res) {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    return send(res, 200, {
+      data: {
+        clock: clockSummary(db, clock),
+        adjustments,
+        retests,
+        latestRetest: latestRetest(db, clock.id),
+        latestApprovedRetest: latestApprovedRetest(db, clock.id)
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -201,6 +230,15 @@ async function handle(req, res) {
       createdAt: new Date().toISOString()
     };
     db.adjustments.push(adjustment);
+    // 新调校产生后，旧的待签核复测记录失效，但保留在历史中可检索
+    const now = new Date().toISOString();
+    db.retests.forEach((item) => {
+      if (item.clockId === clock.id && item.status === "pending") {
+        item.status = "voided";
+        item.voidedAt = now;
+        item.voidReason = "新调校产生，待签核记录失效";
+      }
+    });
     await writeDb(db);
     return send(res, 201, { data: adjustment });
   }
@@ -209,8 +247,17 @@ async function handle(req, res) {
   if (retestMatch && req.method === "POST") {
     const clock = findClock(db, retestMatch[1]);
     const body = await parseBody(req);
-    required(body, ["dailyRateSeconds", "amplitude"]);
+    required(body, ["dailyRateSeconds", "amplitude", "recordedBy"]);
     const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
+    // 同一调校下的复测被驳回后，必须先有新的调校才能再次复测
+    const rejected = db.retests.find((item) =>
+      item.clockId === clock.id && item.status === "rejected" && item.adjustmentId === adjustmentId
+    );
+    if (rejected) {
+      const error = new Error("上一次复测已被驳回，必须先有新的调校才能再次复测");
+      error.status = 409;
+      throw error;
+    }
     const qualified = body.qualified !== undefined
       ? Boolean(body.qualified)
       : Math.abs(Number(body.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
@@ -222,11 +269,54 @@ async function handle(req, res) {
       dailyRateSeconds: Number(body.dailyRateSeconds),
       amplitude: Number(body.amplitude),
       qualified,
+      status: "pending",
+      recordedBy: body.recordedBy,
+      signoff: null,
       note: body.note || ""
     };
     db.retests.push(retest);
     await writeDb(db);
     return send(res, 201, { data: retest, clock: clockSummary(db, clock) });
+  }
+
+  const signoffMatch = pathname.match(/^\/retests\/([^/]+)\/signoff$/);
+  if (signoffMatch && req.method === "POST") {
+    const retest = db.retests.find((item) => item.id === signoffMatch[1]);
+    if (!retest) {
+      const error = new Error("复测记录不存在");
+      error.status = 404;
+      throw error;
+    }
+    const body = await parseBody(req);
+    required(body, ["decision", "conclusion", "signedBy"]);
+    if (!["approved", "rejected"].includes(body.decision)) {
+      const error = new Error("decision 必须是 approved 或 rejected");
+      error.status = 400;
+      throw error;
+    }
+    if (retest.status !== "pending") {
+      const message = retest.status === "voided"
+        ? "该复测记录已失效，不能签核"
+        : "该复测记录已签核，不能重复签核";
+      const error = new Error(message);
+      error.status = 409;
+      throw error;
+    }
+    if (body.signedBy === retest.recordedBy) {
+      const error = new Error("签核人不得与复测记录人相同");
+      error.status = 409;
+      throw error;
+    }
+    retest.status = body.decision;
+    retest.signoff = {
+      decision: body.decision,
+      conclusion: body.conclusion,
+      signedBy: body.signedBy,
+      signedAt: new Date().toISOString()
+    };
+    await writeDb(db);
+    const clock = findClock(db, retest.clockId);
+    return send(res, 200, { data: retest, clock: clockSummary(db, clock) });
   }
 
   const latestMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-retest$/);
@@ -243,10 +333,12 @@ async function handle(req, res) {
   if (req.method === "GET" && pathname === "/retests") {
     const clockId = url.searchParams.get("clockId");
     const qualified = url.searchParams.get("qualified");
+    const status = url.searchParams.get("status");
     const data = db.retests.filter((item) => {
       const matchClock = !clockId || item.clockId === clockId;
       const matchQualified = qualified === null || item.qualified === (qualified === "true");
-      return matchClock && matchQualified;
+      const matchStatus = !status || item.status === status;
+      return matchClock && matchQualified && matchStatus;
     });
     return send(res, 200, { data });
   }
